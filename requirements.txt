@@ -1,2 +1,3 @@
 boto3==1.28.15 
 botocore==1.31.15
+pyspark==3.4.1
