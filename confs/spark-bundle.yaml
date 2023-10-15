@@ -1,0 +1,187 @@
+bundle: kubernetes
+applications:
+  alertmanager:
+    charm: alertmanager-k8s
+    channel: stable
+    revision: 77
+    series: focal
+    resources:
+      alertmanager-image: 66
+    scale: 1
+    constraints: arch=amd64
+    storage:
+      data: kubernetes,1,2048M
+    trust: true
+  catalogue:
+    charm: catalogue-k8s
+    channel: stable
+    revision: 19
+    series: focal
+    resources:
+      catalogue-image: 19
+    scale: 1
+    options:
+      description: "Canonical Observability Stack Lite, or COS Lite, is a light-weight,
+        highly-integrated, \nJuju-based observability suite running on Kubernetes.\n"
+      tagline: Model-driven Observability Stack deployed with a single command.
+      title: Canonical Observability Stack
+    constraints: arch=amd64
+    trust: true
+  cos-configuration:
+    charm: cos-configuration-k8s
+    channel: stable
+    revision: 15
+    series: focal
+    resources:
+      git-sync-image: 8
+    scale: 1
+    options:
+      git_branch: dashboard
+      git_depth: 1
+      git_repo: https://github.com/canonical/charmed-spark-rock
+      grafana_dashboards_path: dashboards/prod/grafana/
+    constraints: arch=amd64
+    storage:
+      content-from-git: kubernetes,1,1024M
+  grafana:
+    charm: grafana-k8s
+    channel: stable
+    revision: 82
+    series: focal
+    resources:
+      grafana-image: 50
+      litestream-image: 32
+    scale: 1
+    constraints: arch=amd64
+    storage:
+      database: kubernetes,1,2048M
+    trust: true
+  loki:
+    charm: loki-k8s
+    channel: stable
+    revision: 91
+    series: focal
+    resources:
+      loki-image: 75
+    scale: 1
+    constraints: arch=amd64
+    storage:
+      active-index-directory: kubernetes,1,2048M
+      loki-chunks: kubernetes,1,10240M
+    trust: true
+  prometheus:
+    charm: prometheus-k8s
+    channel: stable
+    revision: 129
+    series: focal
+    resources:
+      prometheus-image: 108
+    scale: 1
+    constraints: arch=amd64
+    storage:
+      database: kubernetes,1,10240M
+    trust: true
+  prometheus-pushgateway:
+    charm: prometheus-pushgateway-k8s
+    channel: edge
+    revision: 5
+    resources:
+      pushgateway-image: 4
+    scale: 1
+    constraints: arch=amd64
+    storage:
+      pushgateway-store: kubernetes,1,1024M
+  s3:
+    charm: s3-integrator
+    channel: edge
+    revision: 13
+    scale: 1
+    options:
+      bucket:  $AWS_S3_BUCKET
+      endpoint: $AWS_S3_ENDPOINT
+      path: spark-events
+    constraints: arch=amd64
+  scrape-interval-config:
+    charm: prometheus-scrape-config-k8s
+    channel: stable
+    revision: 39
+    series: focal
+    scale: 1
+    options:
+      scrape_interval: 10s
+  history-server:
+    charm: spark-history-server-k8s
+    channel: 3.4/edge
+    revision: 15
+    resources:
+      spark-history-server-image: 9
+    scale: 1
+    constraints: arch=amd64
+  traefik:
+    charm: traefik-k8s
+    channel: edge
+    revision: 161
+    series: focal
+    resources:
+      traefik-image: 152
+    scale: 1
+    options:
+      external_hostname: $AWS_ROUTE53_DOMAIN
+    constraints: arch=amd64
+    storage:
+      configurations: kubernetes,1,1024M
+    trust: true
+relations:
+- - traefik:ingress-per-unit
+  - prometheus:ingress
+- - traefik:ingress-per-unit
+  - loki:ingress
+- - traefik:traefik-route
+  - grafana:ingress
+- - traefik:ingress
+  - alertmanager:ingress
+- - prometheus:alertmanager
+  - alertmanager:alerting
+- - grafana:grafana-source
+  - prometheus:grafana-source
+- - grafana:grafana-source
+  - loki:grafana-source
+- - grafana:grafana-source
+  - alertmanager:grafana-source
+- - loki:alertmanager
+  - alertmanager:alerting
+- - prometheus:metrics-endpoint
+  - traefik:metrics-endpoint
+- - prometheus:metrics-endpoint
+  - alertmanager:self-metrics-endpoint
+- - prometheus:metrics-endpoint
+  - loki:metrics-endpoint
+- - prometheus:metrics-endpoint
+  - grafana:metrics-endpoint
+- - grafana:grafana-dashboard
+  - loki:grafana-dashboard
+- - grafana:grafana-dashboard
+  - prometheus:grafana-dashboard
+- - grafana:grafana-dashboard
+  - alertmanager:grafana-dashboard
+- - catalogue:ingress
+  - traefik:ingress
+- - catalogue:catalogue
+  - grafana:catalogue
+- - catalogue:catalogue
+  - prometheus:catalogue
+- - catalogue:catalogue
+  - alertmanager:catalogue
+- - prometheus-pushgateway:metrics-endpoint
+  - prometheus:metrics-endpoint
+- - history-server:ingress
+  - traefik:ingress
+- - scrape-interval-config:configurable-scrape-jobs
+  - prometheus-pushgateway:metrics-endpoint
+- - scrape-interval-config:metrics-endpoint
+  - prometheus:metrics-endpoint
+# This will be provided during DEMO
+# - - cos-configuration:grafana-dashboards
+#   - grafana:grafana-dashboard
+
+

@@ -4,11 +4,11 @@ This repository contains the material of the Demo held at Operator Day 2023 for 
 
 ## Playscript
 
-The demo is broken into 4 stages:
+The demo is broken into 3 stages:
 1. Setup
 2. Develop
-3. Scale
-4. Monitor
+3. Scale & Observe 
+4. Cleanup
 
 ##### Prerequisite
 
@@ -30,6 +30,7 @@ export AWS_S3_ENDPOINT=<s3-endpoint>
 export AWS_S3_BUCKET=<bucket-name>
 export AWS_ACCESS_KEY=<your-access-key>
 export AWS_SECRET_KEY=<your-secret-key>
+export AWS_ROUTE53_DOMAIN=<your-domain> 
 ```
 
 To carry out this demo, we will need a few components that needs to be installed.
@@ -204,7 +205,7 @@ spark-client.spark-submit \
     --output s3a://$AWS_S3_BUCKET/data/output_report_microk8s
 ```
 
-### Scale
+### Scale & Observe
 
 It is now time to scale our jobs from our local environment to a proper production cluster running 
 on AWS EKS.
@@ -234,13 +235,137 @@ authenticate to EKS are stored.
 You can now choose which cluster to use via the `context` argument of the `spark-client` CLI, 
 allowing you to seamlessly switch from the local to the production kubernetes.
 
+#### Spark Observability stack
+
+An important requirement of a production-ready system is to provide a way for the admins to monitor
+and actively observe the operation of the cluster. Charmed Spark comes with an observability 
+stack that provides:
+1. a deployment of a Spark History Server, that is a UI that most Spark users are accustomed to, to 
+   analyze their jobs, at a more business level (e.g. jobs separated by the different steps and so 
+   on) 
+2. a deployment of a COS-lite bundle with Grafana Dashboards, that is more oriented to cluster 
+   administrators, allowing to set up alerts and dashboarding based on resource utilization, also 
+   providing the ability to set up an alerting system
+
+Logs of driver and executors are by default stored on the pod local file system, and are therefore
+lost once the jobs finishes. However, Spark allows us to store these logs into S3, such that 
+they can be re-read and visualized by the Spark History Server, allowing to monitor and visualize
+the information and metrics about the job execution. Moreover, Spark driver and executors real-time
+metrics can also be sent by the job to a Prometheus Pushgateway, where they are temporarily stored
+to allow Prometheus to scrape them subsequently, and exposing them via Grafana. All these 
+components will be deployed and managed by Juju. 
+
+To enable monitoring, we should therefore
+* Deploy and configure the Charmed Spark Observability stack using Juju
+* Configure the Spark service account to provide configuration for Spark jobs to store logs in 
+   a S3 bucket and push metrics to the Prometheus Pushgateway endpoint
+
+##### Setup Juju 
+
+These deployments, configuration and operations are managed through juju. Once the EKS cluster is 
+up and running, you need to register the EKS K8s cluster in Juju with
+
+```shell
+juju add-k8s spark-cluster
+```
+
+You then need to bootstrap a Juju controller, that is the component of the Juju ecosystem 
+responsible for coordinating operations and managing your services
+
+```shell
+juju bootstrap spark-cluster
+```
+
+Finally, you need to add a new model/namespace where to deploy Spark components/workloads 
+
+```shell
+juju add-model spark
+```
+
+##### Deploy the bundle
+
+You can now deploy all the charms required by the Monitoring stack using the provided bundle 
+(where the relevant configurations need to be replaced using the environment variable)
+
+```shell
+YQ_CMD=".applications.s3.options.bucket=strenv(AWS_S3_BUCKET)"\
+"| .applications.s3.options.endpoint=strenv(AWS_S3_ENDPOINT)"\
+"| .applications.traefik.options.external_hostname=strenv(AWS_ROUTE53_DOMAIN)"
+juju deploy --trust <( yq e "$YQ_CMD" ./confs/spark-bundle.yaml )
+```
+
+###### Configure components
+
+The credentials of AWS needs to be provided separately, as these may also be changed and rotated
+regularly and they are not part of the static configuration of the Juju deployment. 
+Once the charms are deployed, you therefore need to configurations the `s3` charm that 
+holds the credentials of the S3 bucket. 
+
+```shell
+juju run s3/leader sync-s3-credentials \
+  access-key=$AWS_ACCESS_KEY secret-key=$AWS_SECRET_KEY &>/dev/null
+```
+
+Once all the charms have settled into an `active/idle` states,  `history-server` can then
+be related to the `s3` to provide the S3 credentials to the Spark History server to 
+be able to read the logs from the object storage. 
+
+```shell
+juju relate history-server s3
+```
+
+and the `cos-configuration` charm can be related to `grafana` to provide some defaults 
+dashboards
+
+```shell
+juju relate cos-configuration grafana
+```
+
+###### Expose Services externally
+
+In order to expose the different UI of the Charmed Spark Monitoring stack using the Route53 domain, 
+fetch the internal load balancer address
+
+```shell
+juju status --format yaml | yq .applications.traefik.address
+```
+
+and use this information to create a record in your domain, e.g. `spark.<domain-name>`.
+
+Once the charms settle down into `active/idle` states, you can then fetch the external Spark 
+History Server URL (alongside other components of the bundle) using `traefik` via the action
+
+```shell
+juju run traefik/leader show-proxied-endpoints
+```
+
+In your browser, you should now be able to access the Spark History Server UI. The Spark History 
+Server does not support authentication just yet, and you should already be able to explore it
+
+Similarly, you can also assess to the grafana dashboard:
+
+```shell
+http://<your-domain>/spark-grafana
+```
+
+However, Grafana needs authentication. The admin user credentials can be fetched using a dedicated
+action 
+
+```shell
+juju run grafana/leader get-admin-password
+```
+
+The Charmed Spark Monitoring stack is now ready to be used!
+
+#### Run Observed Spark Jobs
+
 In order to run a Spark workload on the new cluster, you should first create your production 
 Spark service account as well, e.g. 
 
 ```shell
 spark-client.service-account-registry create \
   --context <eks-context-name> \
-  --username spark --namespace spark \ 
+  --username spark --namespace spark \
   --properties-file ./confs/s3.conf
 ```
 
@@ -250,6 +375,26 @@ spark-client.service-account-registry create \
 > 
 > `kubectl --kubeconfig path/to/kubeconfig config use-context <context-name>`
 >
+
+To enable Spark Jobs to be monitored, we need to further configure the Spark service account 
+by enabling
+* to store logs into a S3 bucket
+* to push metrics the Prometheus Pushgateway endpoint
+
+We need to fetch and store the address of the Prometheus Pushgateway endpoint in an 
+environment variable
+```shell
+export PROMETHEUS_GATEWAY=$(juju status --format=yaml | yq ".applications.prometheus-pushgateway.address") 
+export PROMETHEUS_PORT=9091
+```
+
+We can now add these configuration to the Spark service account with
+
+```shell
+spark-client.service-account-registry add-config \
+  --username spark --namespace spark \
+  --properties-file ./confs/spark-observability.conf
+```
 
 Once this is done, you are now all setup to run your job at scale
 
@@ -263,101 +408,9 @@ spark-client.spark-submit \
     --output s3a://$AWS_S3_BUCKET/data/output_report_eks
 ```
 
-Where we have also explicitly imposed to now run with 4 executors. 
-
-### Monitor
-
-Logs of driver and executors are by default stored on the pod local file system, and are therefore
-lost once the jobs finishes. However, Spark allows us to store these logs into S3, such that 
-they can be re-read and visualized by the Spark History Server, allowing to monitor and visualise
-the information and metrics about the job execution. 
-
-To enable monitoring, we should therefore
-* Configure the Spark service account to provide configuration for Spark jobs to store logs in 
-   a S3 bucket
-* Deploy the Spark History Server with Juju, configuring it to read from the same bucket
-
-#### Spark service account configuration 
-
-The configuration needed for storing logs on the S3 bucket can be appended to the already 
-existing ones with the following command
-
-```shell
-spark-client.service-account-registry add-config \
-  --username spark --namespace spark \
-  --properties-file ./confs/spark-logs.conf
-```
-
-#### Deploy Spark History Server with Juju
-
-First of all, you need to register the EKS K8s cluster in Juju with
-
-```shell
-juju add-k8s spark-cluster
-```
-
-You then need to bootstrap a Juju controller responsible for managing your services
-
-```shell
-juju bootstrap spark-cluster
-```
-
-##### Deploy the charms
-
-First, add a new model/namespace where to deploy the History Server related charms
-
-```shell
-juju add-model history-server
-```
-
-You can now deploy all the charms required by the History Server, using the provided bundle 
-(but replacing the environment variable)
-
-```shell
-juju deploy --trust \
- <( yq e '.applications.s3-integrator.options.bucket=strenv(AWS_S3_BUCKET) | .applications.s3-integrator.options.endpoint=strenv(AWS_S3_ENDPOINT)' ./eks/history-server.yaml )
-```
-
-##### Setup the charms 
-
-Once the charms are deployed, you need to perform some configurations on the `s3-integrator` and 
-on `traefik-k8s`.
-
-###### S3 Integrator 
-
-the `s3-integrator` needs to be correctly configured by providing the S3 credentials, e.g. 
-
-```shell
-juju run s3-integrator/leader sync-s3-credentials \
-  access-key=$AWS_ACCESS_KEY secret-key=$AWS_SECRET_KEY
-```
-
-###### Traefik K8s 
-
-In order to expose the Spark History server UI using the Route53 domain, fetch the internal 
-load balancer address
-
-```shell
-juju status --format yaml | yq .applications.traefik-k8s.address
-```
-
-and use this information to create a record in your domain, e.g. `spark.<domain-name>`.
-
-##### Integrate the charms
-
-At this point, the `spark-history-server-k8s` can be related to the `s3-integrator` charm and to
-the `traefik-k8s` charm to be able to read the logs from S3 and to be exposed externally, 
-respectively.
-
-Once the charms settle down into `active/idle` states, you can then fetch the external Spark 
-History Server URL using `traefik-k8s` via the action
-
-```shell
-juju run traefik-k8s/leader show-proxied-endpoints
-```
-
-In your browser, you should now be able to access the Spark History Server UI and explore the logs
-of completed jobs. 
+Where we have also explicitly imposed to now run with 4 executors. Once this is done (or even 
+during the execution) navigate to the Grafana and Spark History server dashboards to see, explore
+and analyze the logs of the job. 
 
 ### Cleanup
 
@@ -386,6 +439,3 @@ python scripts/spark_bucket.py \
   --endpoint $AWS_S3_ENDPOINT \
   --bucket $AWS_S3_BUCKET 
 ```
-
-
-
